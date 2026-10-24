@@ -1,0 +1,17 @@
+[project]
+name = "eboard"
+version = "0.1.2"
+description = "Qt Quick keyboard with e-paper feedback for Kindle and Kobo"
+requires-python = ">=3.9"
+dependencies = ["PyQt5>=5.15.6,<6"]
+license = {text = "MIT"}
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["eboard"]
+
+[tool.setuptools.package-data]
+eboard = ["qml/EBoard/*.qml", "qml/EBoard/qmldir"]
