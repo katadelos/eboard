@@ -66,7 +66,7 @@ class WindowGrayscaleRefresh(QObject):
 
     Awesome owns the display policy. Its lab126_flash message accepts a
     client-relative rectangle and refuses obscured areas. Its public fidelity
-    map includes GC=6, FAST_FULL=1 and FULL=7 (lab126_ligl.lua's s_fid_map).
+    map includes GC=6, FAST_FULL=1 and SLOW_FULL=9 (lab126_ligl.lua's s_fid_map).
     Explicit scene transitions request flashing cleanup after fresh damage.
     DM:KB sets the native fast
     keyboard policy over keys only; extra A2/DU requests would duplicate its
@@ -360,7 +360,7 @@ class WindowGrayscaleRefresh(QObject):
     def request_cleanup(self, full: bool = True):
         """Clean the whole client after the next drawing settles.
 
-        Call before the transition renders. FULL (7) takes precedence over
+        Call before the transition renders. SLOW_FULL (9) takes precedence over
         FAST_FULL (1) when transitions overlap. Existing damage cannot fulfill
         the request; an inactive window drops it instead of flashing on return.
         """
@@ -371,7 +371,9 @@ class WindowGrayscaleRefresh(QObject):
         # have changed the scene, but Qt has not rendered their next frame yet.
         self._x11.XSync(self._display, False)
         self._drain(limit=self._x11.XPending(self._display))
-        self._cleanup_fidelity = max(self._cleanup_fidelity, 7 if full else 1)
+        # FULL (7) selects GC16_FAST on older Kindles. Thin gray outlines need
+        # the full-length GC16 waveform, selected explicitly by SLOW_FULL (9).
+        self._cleanup_fidelity = max(self._cleanup_fidelity, 9 if full else 1)
         self._cleanup_ready = False
         self._idle.stop()
         self._deadline.stop()
