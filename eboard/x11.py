@@ -66,7 +66,9 @@ class WindowGrayscaleRefresh(QObject):
 
     Awesome owns the display policy. Its lab126_flash message accepts a
     client-relative rectangle and refuses obscured areas. Its public fidelity
-    map includes GC=6 (lab126_ligl.lua's s_fid_map). DM:KB sets the native fast
+    map includes GC=6, FAST_FULL=1 and FULL=7 (lab126_ligl.lua's s_fid_map).
+    Explicit scene transitions request flashing cleanup after fresh damage.
+    DM:KB sets the native fast
     keyboard policy over keys only; extra A2/DU requests would duplicate its
     automatic updates. XDamage orders feedback after the client's drawing,
     but does not acknowledge physical panel completion.
@@ -83,6 +85,8 @@ class WindowGrayscaleRefresh(QObject):
         self._display = None
         self._notifier = None
         self._pending = QRegion()
+        self._cleanup_fidelity = 0
+        self._cleanup_ready = False
         self._typing = False
         self._typing_rectangle = QRect()
         self._typing_region = QRegion()
@@ -179,9 +183,14 @@ class WindowGrayscaleRefresh(QObject):
         self._set_typing_mode(rectangle)
         typing_changed = typing != self._typing
         self._typing = typing
-        self._idle.setInterval(700 if typing and self._typing_setup.isEmpty() else 120)
+        self._idle.setInterval(
+            700
+            if typing and self._typing_setup.isEmpty() and not self._cleanup_fidelity
+            else 120
+        )
         if typing_changed or region_changed:
-            self._deadline.stop()
+            if not self._cleanup_ready:
+                self._deadline.stop()
             if not self._pending.isEmpty():
                 self._idle.start()
         if not typing:
@@ -246,6 +255,7 @@ class WindowGrayscaleRefresh(QObject):
             "XPending": ([pointer], ctypes.c_int),
             "XNextEvent": ([pointer, ctypes.POINTER(_XEvent)], ctypes.c_int),
             "XFlush": ([pointer], ctypes.c_int),
+            "XSync": ([pointer, ctypes.c_int], ctypes.c_int),
             "XSendEvent": (
                 [pointer, xid, ctypes.c_int, ctypes.c_long, ctypes.POINTER(_XEvent)],
                 ctypes.c_int,
@@ -279,6 +289,8 @@ class WindowGrayscaleRefresh(QObject):
 
     def _clear_pending(self):
         self._pending = QRegion()
+        self._cleanup_fidelity = 0
+        self._cleanup_ready = False
         self._feedback.clear()
         self._idle.stop()
         self._deadline.stop()
@@ -289,7 +301,7 @@ class WindowGrayscaleRefresh(QObject):
             if not self._drain_timer.isActive():
                 self._drain_timer.start(0)
 
-    def _drain(self, *_):
+    def _drain(self, *_, limit=64):
         if self._closed:
             return
         self._drain_timer.stop()
@@ -298,7 +310,7 @@ class WindowGrayscaleRefresh(QObject):
         damaged = False
         current = QRegion()
         # Bound a batch so sustained rendering cannot monopolize Qt's event loop.
-        for _ in range(64):
+        for _ in range(limit):
             if not self._x11.XPending(self._display):
                 break
             self._x11.XNextEvent(self._display, ctypes.byref(event))
@@ -317,7 +329,12 @@ class WindowGrayscaleRefresh(QObject):
             current += rectangle
         if not current.isEmpty():
             self._pending += current
-            if (not self._typing or not self._typing_setup.isEmpty()) and not self._deadline.isActive():
+            if self._cleanup_fidelity:
+                self._cleanup_ready = True
+                self._idle.setInterval(120)
+            if (
+                self._cleanup_ready or not self._typing or not self._typing_setup.isEmpty()
+            ) and not self._deadline.isActive():
                 self._deadline.start()
             self._idle.start()
         if self._typing and not current.isEmpty():
@@ -340,11 +357,37 @@ class WindowGrayscaleRefresh(QObject):
         if not self._typing:
             self._refresh()
 
+    def request_cleanup(self, full: bool = True):
+        """Clean the whole client after the next drawing settles.
+
+        Call before the transition renders. FULL (7) takes precedence over
+        FAST_FULL (1) when transitions overlap. Existing damage cannot fulfill
+        the request; an inactive window drops it instead of flashing on return.
+        """
+        if not self._eligible():
+            self._clear_pending()
+            return
+        # Finish delivery of previous drawing before arming. QML transitions
+        # have changed the scene, but Qt has not rendered their next frame yet.
+        self._x11.XSync(self._display, False)
+        self._drain(limit=self._x11.XPending(self._display))
+        self._cleanup_fidelity = max(self._cleanup_fidelity, 7 if full else 1)
+        self._cleanup_ready = False
+        self._idle.stop()
+        self._deadline.stop()
+
     def _refresh(self):
         if self._closed:
             return
         # Include any already-arrived damage before choosing the settle area.
         self._drain()
+        if not self._eligible():
+            self._clear_pending()
+            return
+        if self._cleanup_fidelity and not self._cleanup_ready:
+            self._idle.stop()
+            self._deadline.stop()
+            return
         # A layout change can leave dozens of narrow damage strips. Sending
         # each separately queues slow panel updates behind the new keyboard.
         # Coalesce first, then exclude typing areas so key feedback stays local.
@@ -352,17 +395,20 @@ class WindowGrayscaleRefresh(QObject):
         self._pending = QRegion()
         self._idle.stop()
         self._deadline.stop()
-        if not self._eligible():
-            return
+        fidelity = self._cleanup_fidelity or 6
+        if self._cleanup_fidelity:
+            region = QRegion(self._window_rectangle())
+            self._cleanup_fidelity = 0
+            self._cleanup_ready = False
         # Newly exposed keys and fields need one settle pass to replace the
         # previous page. Afterwards keep them out of grayscale refreshes so
         # typing retains its fast, local feedback.
-        if self._typing:
+        if self._typing and fidelity == 6:
             region -= self._typing_region.subtracted(self._typing_setup)
         self._typing_setup = QRegion()
         self._idle.setInterval(700 if self._typing else 120)
         for rectangle in region.rects():
-            self._send(rectangle, 6)
+            self._send(rectangle, fidelity)
         self._x11.XFlush(self._display)
 
     def _send(self, rectangle, fidelity):
