@@ -28,51 +28,56 @@ def _steady_cursor(owner, active):
             _cursor_interval = None
 
 
-class _Kobo:
+class _Framebuffer:
     def __init__(self):
         paths = (
-            Path(p) / "platforms/libkobo.so" for p in QCoreApplication.libraryPaths()
+            Path(p) / "platforms/libqereader.so" for p in QCoreApplication.libraryPaths()
         )
         path = next(p for p in paths if p.is_file())
         self.library = ctypes.CDLL(str(path))
         signatures = {
-            "kobo_set_typing_mode": ([ctypes.c_bool], None),
-            "kobo_set_keyboard_regions": (
+            "ereader_set_typing_mode": ([ctypes.c_bool], None),
+            "ereader_set_keyboard_regions": (
                 [ctypes.POINTER(ctypes.c_int), ctypes.c_int],
                 None,
             ),
-            "kobo_keyboard_frame": ([], ctypes.c_uint64),
-            "kobo_keyboard_region_ready": (
+            "ereader_keyboard_frame": ([], ctypes.c_uint64),
+            "ereader_keyboard_region_ready": (
                 [ctypes.c_int] * 4 + [ctypes.c_uint64],
                 ctypes.c_bool,
             ),
+            "ereader_keyboard_feedback_delay": ([], ctypes.c_int),
         }
         for name, (arguments, result) in signatures.items():
             function = getattr(self.library, name)
             function.argtypes, function.restype = arguments, result
+        self.minimum_feedback_ms = self.library.ereader_keyboard_feedback_delay()
 
     def regions(self, rectangles):
         flat = [value for rect in rectangles for value in rect.getRect()]
         values = (ctypes.c_int * len(flat))(*flat)
-        self.library.kobo_set_keyboard_regions(values, len(rectangles))
-        self.library.kobo_set_typing_mode(bool(rectangles))
+        self.library.ereader_set_keyboard_regions(values, len(rectangles))
+        self.library.ereader_set_typing_mode(bool(rectangles))
 
     def frame(self):
-        return self.library.kobo_keyboard_frame()
+        return self.library.ereader_keyboard_frame()
 
     def ready(self, rectangle, frame):
-        return self.library.kobo_keyboard_region_ready(*rectangle.getRect(), frame)
+        return self.library.ereader_keyboard_region_ready(*rectangle.getRect(), frame)
 
 
 class Display(QObject):
     def __init__(self, parent, *, device, family):
         super().__init__(parent)
-        self._kindle = device and family == "kindle"
+        platform = QGuiApplication.platformName()
+        self._x11 = device and platform == "xcb"
         self._monochrome_keys = family == "kindle"
-        self._kobo = (
-            _Kobo() if device and QGuiApplication.platformName() == "kobo" else None
+        self._framebuffer = (
+            _Framebuffer() if device and platform == "ereader" else None
         )
-        self.minimum_feedback_ms = 0 if self._kobo else 120
+        self.minimum_feedback_ms = (
+            self._framebuffer.minimum_feedback_ms if self._framebuffer else 120
+        )
         self._sessions = set()
         self._windows = {}
         self._closed = False
@@ -83,8 +88,8 @@ class Display(QObject):
         return self._monochrome_keys
 
     def attach(self, window):
-        """Return the Kindle damage refresher, or None on other platforms."""
-        if self._kindle and window not in self._windows:
+        """Return the X11 damage refresher, or None on framebuffer platforms."""
+        if self._x11 and window not in self._windows:
             from .x11 import WindowGrayscaleRefresh
 
             self._windows[window] = WindowGrayscaleRefresh(window, self)
@@ -99,8 +104,8 @@ class Display(QObject):
             self._sessions.discard(session)
         self._sessions = {s for s in self._sessions if not sip.isdeleted(s)}
         _steady_cursor(self, bool(self._sessions))
-        if self._kobo:
-            self._kobo.regions(
+        if self._framebuffer:
+            self._framebuffer.regions(
                 [rect for s in self._sessions for rect in s.rectangles()]
             )
         for window, refresh in self._windows.items():
@@ -112,8 +117,8 @@ class Display(QObject):
             )
 
     def frame(self, item):
-        if self._kobo:
-            return self._kobo.frame()
+        if self._framebuffer:
+            return self._framebuffer.frame()
         refresh = self._windows.get(item.window())
         return refresh.frame() if refresh else 0
 
@@ -125,8 +130,8 @@ class Display(QObject):
             refresh.expect_key(item.scene_rectangle())
 
     def ready(self, item, frame):
-        if self._kobo:
-            return self._kobo.ready(item.scene_rectangle(), frame)
+        if self._framebuffer:
+            return self._framebuffer.ready(item.scene_rectangle(), frame)
         refresh = self._windows.get(item.window())
         return not refresh or refresh.key_ready(item.scene_rectangle(), frame)
 
@@ -135,8 +140,8 @@ class Display(QObject):
             return
         self._closed = True
         _steady_cursor(self, False)
-        if self._kobo:
-            self._kobo.regions([])
+        if self._framebuffer:
+            self._framebuffer.regions([])
         self._sessions.clear()
         for refresh in self._windows.values():
             refresh.close()
