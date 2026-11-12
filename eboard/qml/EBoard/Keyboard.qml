@@ -1,4 +1,4 @@
-// Keyboard layout and styling adapted from ktrmnl2.
+// Keyboard layout and styling adapted from ktrmnl.
 import QtQuick 2.15
 import EBoard 1.0
 
